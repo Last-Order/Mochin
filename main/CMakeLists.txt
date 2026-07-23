@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "main.c"
+    SRCS "app_main.c"
     INCLUDE_DIRS "."
-    PRIV_REQUIRES esp_lcd esp_driver_gpio esp_driver_spi
+    PRIV_REQUIRES app_display board_buttons
 )
