@@ -6,13 +6,6 @@
 ESP-IDF 开发。不要把它改回 Arduino 工程，也不要把 Arduino 库混入
 ESP-IDF 的组件依赖。
 
-当前工程是一个已经在实物上验证过的最小 LCD Hello World：
-
-- 工程入口：`main/main.c`
-- 构建目标：`esp32s3`
-- 本机验证环境：Windows、ESP-IDF v6.0.2、开发板端口 COM5
-- 已验证结果：编译、烧录、8 MB PSRAM 自检、ST7789 初始化和画面显示均成功
-
 COM 口编号不是板卡的固定属性。断开/重新连接或更换 USB 口后应重新确认，
 不要在新环境中盲目沿用 COM5。
 
@@ -51,18 +44,18 @@ Waveshare 的通用 ESP-IDF 教程使用其他板卡演示；复制其中的硬�
 
 ## 已确认的 LCD 与触控引脚
 
-| 功能 | 信号 | GPIO | 备注 |
-| --- | --- | ---: | --- |
-| LCD | SCLK | 38 | 当前工程 SPI2_HOST |
-| LCD | MOSI | 39 | LCD 无需 MISO |
-| LCD | RESET | 40 | 低电平复位 |
-| LCD | DC | 45 | 命令/数据选择 |
-| LCD | CS | 21 | 片选 |
-| LCD | Backlight | 46 | 高电平点亮 |
-| Touch | I2C SCL | 41 | 官方示例 400 kHz |
-| Touch | I2C SDA | 42 | 官方示例 I2C port 0 |
-| Touch | INT | 48 | 触控中断 |
-| Touch | RESET | 47 | 触控复位 |
+| 功能  | 信号      | GPIO | 备注                |
+| ----- | --------- | ---: | ------------------- |
+| LCD   | SCLK      |   38 | 当前工程 SPI2_HOST  |
+| LCD   | MOSI      |   39 | LCD 无需 MISO       |
+| LCD   | RESET     |   40 | 低电平复位          |
+| LCD   | DC        |   45 | 命令/数据选择       |
+| LCD   | CS        |   21 | 片选                |
+| LCD   | Backlight |   46 | 高电平点亮          |
+| Touch | I2C SCL   |   41 | 官方示例 400 kHz    |
+| Touch | I2C SDA   |   42 | 官方示例 I2C port 0 |
+| Touch | INT       |   48 | 触控中断            |
+| Touch | RESET     |   47 | 触控复位            |
 
 当前 LCD 参数已经在实物上验证：
 
