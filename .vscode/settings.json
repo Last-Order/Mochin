@@ -2,5 +2,6 @@
   "idf.currentSetup": "D:\\esp\\v6.0.2\\esp-idf",
   "idf.customExtraVars": {},
   "idf.extensionActivationMode": "always",
-  "C_Cpp.intelliSenseEngine": "default"
+  "C_Cpp.intelliSenseEngine": "default",
+  "idf.portWin": "COM5"
 }
