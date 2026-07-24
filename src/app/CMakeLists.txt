@@ -2,5 +2,10 @@
 idf_component_register(
     SRCS "app_main.c"
     INCLUDE_DIRS "."
-    PRIV_REQUIRES display power standby
+    PRIV_REQUIRES
+        display
+        network
+        power
+        standby
+        time_service
 )

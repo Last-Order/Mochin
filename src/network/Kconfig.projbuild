@@ -1,0 +1,18 @@
+menu "Pet Network"
+
+    config PET_WIFI_SSID
+        string "Wi-Fi SSID"
+        default ""
+        help
+            设备要连接的 2.4 GHz Wi-Fi 名称。该值会写入本机生成的
+            sdkconfig 并编译进固件，不要把 sdkconfig 提交到仓库。
+
+    config PET_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default ""
+        help
+            WPA2/WPA3 Personal 网络密码，长度必须为 8 到 63 字节。
+            密码会写入本机生成的 sdkconfig 并编译进固件；程序不会把它
+            输出到日志。
+
+endmenu

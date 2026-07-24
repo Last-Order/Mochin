@@ -24,3 +24,7 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 # 待机动画资源使用“RGB565 颜色平面 + A8 透明度平面”。显式保留软件绘制
 # 支持，确保重新生成 sdkconfig 后仍能正确混合雪碧图的透明边缘。
 CONFIG_LV_DRAW_SW_SUPPORT_RGB565A8=y
+
+# 待机页顶部时钟固定使用 Montserrat 20。显式写入默认配置，确保删除
+# sdkconfig 后重新生成时仍然包含该字体。
+CONFIG_LV_FONT_MONTSERRAT_20=y

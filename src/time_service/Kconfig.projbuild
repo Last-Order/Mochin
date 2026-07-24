@@ -1,0 +1,10 @@
+menu "Pet Time"
+
+    config PET_SNTP_SERVER
+        string "NTP server"
+        default "pool.ntp.org"
+        help
+            SNTP 使用的单个服务器主机名或文本 IP 地址。该值会写入本机
+            生成的 sdkconfig 并编译进固件；留空会禁用校时。
+
+endmenu

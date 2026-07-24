@@ -10,4 +10,5 @@ idf_component_register(
     PRIV_REQUIRES
         esp_lvgl_port
         lvgl
+        time_service
 )
