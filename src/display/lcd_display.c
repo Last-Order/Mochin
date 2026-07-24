@@ -253,3 +253,32 @@ esp_err_t lcd_display_enable(void)
     ESP_LOGI(TAG, "LCD panel and backlight enabled");
     return ESP_OK;
 }
+
+esp_err_t lcd_display_disable(void)
+{
+    ESP_RETURN_ON_FALSE(s_display.initialized, ESP_ERR_INVALID_STATE, TAG,
+                        "Display is not initialized");
+    ESP_RETURN_ON_FALSE(s_display.enabled, ESP_ERR_INVALID_STATE, TAG,
+                        "Display is not enabled");
+
+    /*
+     * 先关闭背光，用户立即得到关机反馈。取得 LVGL 锁可避免面板关闭命令
+     * 与 LVGL 刷新任务同时访问 SPI 面板；面板关闭后仍保留对象和缓冲，
+     * 因为电池供电马上会由电源组件切断。
+     */
+    ESP_RETURN_ON_ERROR(
+        gpio_set_level(BOARD_LCD_PIN_BACKLIGHT, 0), TAG,
+        "Failed to turn LCD backlight off");
+    ESP_RETURN_ON_FALSE(lvgl_port_lock(0), ESP_FAIL, TAG,
+                        "Failed to lock LVGL while disabling display");
+
+    const esp_err_t panel_result =
+        esp_lcd_panel_disp_on_off(s_display.panel, false);
+    lvgl_port_unlock();
+    ESP_RETURN_ON_ERROR(
+        panel_result, TAG, "Failed to disable LCD panel");
+
+    s_display.enabled = false;
+    ESP_LOGI(TAG, "LCD panel and backlight disabled");
+    return ESP_OK;
+}

@@ -36,7 +36,17 @@
 // SPI 像素时钟已经在实物上验证为 40 MHz。
 #define BOARD_LCD_PIXEL_CLOCK_HZ (40 * 1000 * 1000)
 
-// 三个板载按键均为低电平有效：松开通常读到 1，按下读到 0。
+/*
+ * 电池供电由软件保持：PWR 按键按下时会临时建立供电，程序启动后必须把
+ * BAT_EN 拉高，才能在松开按键后继续运行。主动拉低 BAT_EN 后，若没有
+ * USB 供电，松开 PWR 按键即会切断整板电源。
+ */
+#define BOARD_POWER_HOLD_PIN GPIO_NUM_2
+
+/*
+ * 三个板载按键均为低电平有效：松开通常读到 1，按下读到 0。
+ * PWR(GPIO5) 同时参与硬件临时上电，但它与供电保持 GPIO2 不是同一信号。
+ */
 #define BOARD_BUTTON_PIN_BOOT GPIO_NUM_0
 #define BOARD_BUTTON_PIN_PWR GPIO_NUM_5
 #define BOARD_BUTTON_PIN_PLUS GPIO_NUM_4

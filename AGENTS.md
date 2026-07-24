@@ -24,6 +24,7 @@
     ├── app/                # 应用入口，只负责编排组件
     ├── board/              # 板级引脚和硬件参数
     ├── display/            # LCD 与图形显示
+    ├── power/              # 电池供电保持与 PWR 长按关机
     └── standby/            # 待机页面、动画与页面资源
 ```
 
@@ -31,6 +32,7 @@
 
 ```text
 app ──> display ──> board
+ ├────> power ─────> board
  └────> standby ──> LVGL
 ```
 
@@ -63,6 +65,7 @@ app ──> display ──> board
 | LCD | DC | 45 | 命令/数据选择 |
 | LCD | CS | 21 | 片选 |
 | LCD | Backlight | 46 | 高电平点亮 |
+| Power | BAT_EN | 2 | 高电平保持电池供电 |
 | Touch | I2C SCL | 41 | 官方示例为 400 kHz |
 | Touch | I2C SDA | 42 | 官方示例使用 I2C port 0 |
 | Touch | INT | 48 | 触控中断 |
@@ -79,6 +82,8 @@ app ──> display ──> board
 
 - LCD 使用 `SPI2_HOST`，240 × 240 RGB565，SPI pixel clock 为 40 MHz。
 - ST7789 需要开启颜色反转；当前 SPI mode 和初始化序列已通过实物验证。
+- 电池供电时 PWR 只临时建立供电路径；程序必须尽快将 BAT_EN（GPIO2）
+  拉高，松开 PWR 后才能持续运行。
 - SPI DMA 缓冲必须使用 DMA 兼容内存；异步传输完成前不得释放、覆盖或
   复用正在发送的缓冲区。
 - 当前锁定 LVGL `9.5.0` 和 `espressif/esp_lvgl_port` `2.8.0~1`。

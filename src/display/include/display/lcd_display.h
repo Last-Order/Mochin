@@ -29,3 +29,13 @@ esp_err_t lcd_display_init(void);
  * @return ESP_OK 成功；调用顺序错误或硬件操作失败时返回对应错误。
  */
 esp_err_t lcd_display_enable(void);
+
+/**
+ * @brief 关闭 LCD 背光和面板显示。
+ *
+ * 必须在 lcd_display_enable() 成功后调用。主要供电源管理组件的关机准备
+ * 回调使用，可以从普通 FreeRTOS 任务上下文调用。
+ *
+ * @return ESP_OK 成功；调用顺序错误或硬件操作失败时返回对应错误。
+ */
+esp_err_t lcd_display_disable(void);
