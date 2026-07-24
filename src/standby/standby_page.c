@@ -13,21 +13,24 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
+#include <time.h>
 
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
 #include "lvgl.h"
+#include "time_service/time_service.h"
 
 #define STANDBY_FRAME_WIDTH 192
 #define STANDBY_FRAME_HEIGHT 208
 #define STANDBY_FRAME_COUNT 7
 #define STANDBY_FRAME_INTERVAL_MS 400
-/*
- * 208 像素帧底部含 6 行透明余量。对象底部距屏幕 10 像素时，实际脚底仍
- * 统一落在第 223 行附近，同时保留少量前景地板。
- */
-#define STANDBY_CHARACTER_GROUND_MARGIN 10
+#define STANDBY_CLOCK_INTERVAL_MS 1000
+#define STANDBY_CLOCK_PANEL_WIDTH 80
+#define STANDBY_CLOCK_PANEL_HEIGHT 30
+#define STANDBY_CLOCK_PANEL_Y 6
+#define STANDBY_CLOCK_TEXT_BYTES 6
 #define STANDBY_FRAME_STRIDE (STANDBY_FRAME_WIDTH * sizeof(uint16_t))
 #define STANDBY_FRAME_COLOR_BYTES \
     (STANDBY_FRAME_STRIDE * STANDBY_FRAME_HEIGHT)
@@ -40,6 +43,10 @@
 
 // 场景图片异常未覆盖屏幕时使用的深暖色兜底，不作为实际场景内容。
 #define STANDBY_FALLBACK_BG 0x2F1E19
+// 时钟卡片沿用木屋的深棕色与暖白高光，避免遮挡角色时显得突兀。
+#define STANDBY_CLOCK_PANEL_BG 0x2B1710
+#define STANDBY_CLOCK_PANEL_BORDER 0xF7D891
+#define STANDBY_CLOCK_TEXT_COLOR 0xFFF2C2
 
 /*
  * ESP-IDF EMBED_FILES 使用嵌入文件的文件名生成链接符号。start/end 直接
@@ -55,9 +62,13 @@ static const char *TAG = "standby_page";
 typedef struct {
     lv_obj_t *background;
     lv_obj_t *image;
-    lv_timer_t *timer;
+    lv_obj_t *clock_panel;
+    lv_obj_t *clock_label;
+    lv_timer_t *animation_timer;
+    lv_timer_t *clock_timer;
     standby_scene_id_t scene_id;
     size_t frame_index;
+    char clock_text[STANDBY_CLOCK_TEXT_BYTES];
     bool started;
 } standby_page_context_t;
 
@@ -114,6 +125,33 @@ static void standby_animation_timer_cb(lv_timer_t *timer)
     lv_image_set_src(page->image, &s_frames[page->frame_index]);
 }
 
+/**
+ * @brief LVGL 定时器回调：读取已校准的本地时间并更新分钟显示。
+ *
+ * 时间服务不会阻塞；首次 SNTP 完成前返回 false，页面明确显示“--:--”。
+ * 回调每秒检查一次以便同步后尽快显现，但只有文本实际变化时才让标签重绘。
+ */
+static void standby_clock_timer_cb(lv_timer_t *timer)
+{
+    standby_page_context_t *page = lv_timer_get_user_data(timer);
+    struct tm local_time = {0};
+    char next_text[STANDBY_CLOCK_TEXT_BYTES] = "--:--";
+
+    if (time_service_get_local_time(&local_time)) {
+        if (strftime(next_text, sizeof(next_text), "%H:%M",
+                     &local_time) == 0U) {
+            memcpy(next_text, "--:--", sizeof(next_text));
+        }
+    }
+
+    if (strcmp(page->clock_text, next_text) == 0) {
+        return;
+    }
+
+    memcpy(page->clock_text, next_text, sizeof(page->clock_text));
+    lv_label_set_text(page->clock_label, page->clock_text);
+}
+
 esp_err_t standby_page_start_with_scene(standby_scene_id_t scene_id)
 {
     ESP_RETURN_ON_FALSE(!s_page.started, ESP_ERR_INVALID_STATE, TAG,
@@ -166,26 +204,101 @@ esp_err_t standby_page_start_with_scene(standby_scene_id_t scene_id)
     s_page.scene_id = scene_id;
     s_page.frame_index = 0;
     lv_image_set_src(s_page.image, &s_frames[0]);
-    /*
-     * 角色不再按外框几何中心摆放，而是以固定脚底基线对齐地面。所有帧
-     * 尺寸一致，因此呼吸和眨眼切帧不会改变站立位置；底部余量也让完整
-     * 脚部与屋内地板之间形成清晰接触关系。
-     */
-    lv_obj_align(
-        s_page.image, LV_ALIGN_BOTTOM_MID, 0,
-        -STANDBY_CHARACTER_GROUND_MARGIN);
+    lv_obj_center(s_page.image);
     lv_obj_remove_flag(
         s_page.image, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    /*
+     * 时钟在角色之后创建，始终位于透明角色图片之上。固定 80 × 30 卡片只
+     * 占用屏幕顶部一小块区域；背景使用半透明深棕色，即使角色头部经过
+     * 卡片下方也能保持文字可读。
+     */
+    s_page.clock_panel = lv_obj_create(screen);
+    if (s_page.clock_panel == NULL) {
+        lv_obj_delete(s_page.image);
+        lv_obj_delete(s_page.background);
+        s_page.image = NULL;
+        s_page.background = NULL;
+        lvgl_port_unlock();
+        return ESP_ERR_NO_MEM;
+    }
+    lv_obj_set_size(
+        s_page.clock_panel, STANDBY_CLOCK_PANEL_WIDTH,
+        STANDBY_CLOCK_PANEL_HEIGHT);
+    lv_obj_align(
+        s_page.clock_panel, LV_ALIGN_TOP_MID, 0,
+        STANDBY_CLOCK_PANEL_Y);
+    lv_obj_remove_flag(
+        s_page.clock_panel,
+        LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(
+        s_page.clock_panel, lv_color_hex(STANDBY_CLOCK_PANEL_BG),
+        LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(
+        s_page.clock_panel, LV_OPA_60, LV_PART_MAIN);
+    lv_obj_set_style_border_color(
+        s_page.clock_panel,
+        lv_color_hex(STANDBY_CLOCK_PANEL_BORDER), LV_PART_MAIN);
+    lv_obj_set_style_border_opa(
+        s_page.clock_panel, LV_OPA_60, LV_PART_MAIN);
+    lv_obj_set_style_border_width(
+        s_page.clock_panel, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(
+        s_page.clock_panel, 10, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(
+        s_page.clock_panel, 0, LV_PART_MAIN);
+
+    s_page.clock_label = lv_label_create(s_page.clock_panel);
+    if (s_page.clock_label == NULL) {
+        lv_obj_delete(s_page.clock_panel);
+        lv_obj_delete(s_page.image);
+        lv_obj_delete(s_page.background);
+        s_page.clock_panel = NULL;
+        s_page.image = NULL;
+        s_page.background = NULL;
+        lvgl_port_unlock();
+        return ESP_ERR_NO_MEM;
+    }
+    memcpy(s_page.clock_text, "--:--", sizeof(s_page.clock_text));
+    lv_label_set_text(s_page.clock_label, s_page.clock_text);
+    lv_obj_set_style_text_color(
+        s_page.clock_label,
+        lv_color_hex(STANDBY_CLOCK_TEXT_COLOR), LV_PART_MAIN);
+    lv_obj_set_style_text_font(
+        s_page.clock_label, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_center(s_page.clock_label);
+    lv_obj_remove_flag(
+        s_page.clock_label,
+        LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
 
     /*
      * 定时器属于 LVGL 对象体系，由 LVGL 任务周期调用。400 ms 对应
      * 2.5 fps，一轮 7 帧约 2.8 秒，让轻微呼吸/眨眼动作保持舒缓。
      */
-    s_page.timer = lv_timer_create(
+    s_page.animation_timer = lv_timer_create(
         standby_animation_timer_cb, STANDBY_FRAME_INTERVAL_MS, &s_page);
-    if (s_page.timer == NULL) {
+    if (s_page.animation_timer == NULL) {
+        lv_obj_delete(s_page.clock_panel);
         lv_obj_delete(s_page.image);
         lv_obj_delete(s_page.background);
+        s_page.clock_panel = NULL;
+        s_page.clock_label = NULL;
+        s_page.image = NULL;
+        s_page.background = NULL;
+        lvgl_port_unlock();
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_page.clock_timer = lv_timer_create(
+        standby_clock_timer_cb, STANDBY_CLOCK_INTERVAL_MS, &s_page);
+    if (s_page.clock_timer == NULL) {
+        lv_timer_delete(s_page.animation_timer);
+        lv_obj_delete(s_page.clock_panel);
+        lv_obj_delete(s_page.image);
+        lv_obj_delete(s_page.background);
+        s_page.animation_timer = NULL;
+        s_page.clock_panel = NULL;
+        s_page.clock_label = NULL;
         s_page.image = NULL;
         s_page.background = NULL;
         lvgl_port_unlock();
