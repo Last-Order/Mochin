@@ -1,13 +1,18 @@
 /*
  * 显示组件的内部实现。
  *
- * 这个文件可以按三层来阅读：
- * 1. frame_* 函数：只在内存中的 RGB565 帧缓冲上画点、矩形和文字；
- * 2. display_render_and_show()：把画好的帧通过 DMA 发送给 LCD；
- * 3. app_display_* 公共函数：为应用层提供简单、稳定的界面操作。
+ * 推荐按以下顺序阅读：
+ * 1. app_display_init()：初始化背光、SPI、ST7789 和 LVGL；
+ * 2. display_create_ui()：用 LVGL 对象搭出原有的边框、标题和主消息；
+ * 3. display_update_ui()：在按键回调所在任务中安全更新 LVGL 对象。
  *
- * 将“画什么”和“怎样驱动 LCD”放在同一组件内部，可以保证应用入口不需要
- * 了解 ST7789 命令、SPI 时序和 DMA 缓冲生命周期。
+ * 本文件仍然负责已经在实物上验证的板级显示初始化，LVGL 不会替代
+ * esp_lcd，也不会修改 Waveshare 面板所需的寄存器设置。迁移后的边界是：
+ *
+ * - esp_lcd：负责 ST7789、SPI 命令和 DMA 像素传输；
+ * - esp_lvgl_port：负责 LVGL tick、任务、刷新回调和 DMA 缓冲生命周期；
+ * - LVGL：负责文字、边框、颜色、布局和脏区域重绘；
+ * - app_display 公共 API：继续向应用层提供与迁移前相同的业务操作。
  */
 
 #include "display/app_display.h"
@@ -15,7 +20,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <string.h>
 
 #include "board/board_config.h"
 #include "driver/gpio.h"
@@ -25,266 +29,63 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_log.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
+#include "esp_lvgl_port.h"
+#include "lvgl.h"
 
 /*
- * 每个像素使用 RGB565，占 16 bit（2 字节）。
- * 240 × 240 × 2 = 115200 字节，因此必须确认 SPI 总线允许这么大的传输。
+ * LVGL 使用“部分刷新”时，绘制缓冲不必覆盖整屏。官方建议缓冲至少能容纳
+ * 约 1/10 屏幕，因此这里使用 24 行，并启用双缓冲：
+ *
+ * 240 × 24 × 2 字节 × 2 个缓冲 = 23040 字节。
+ *
+ * 两个缓冲都放在 DMA 可访问的内部内存中。LVGL 可以在一个缓冲传输时绘制
+ * 另一个缓冲，esp_lvgl_port 会在 DMA 完成前阻止 LVGL 复用正在发送的数据。
  */
-#define LCD_FRAME_BUFFER_SIZE \
-    (BOARD_LCD_WIDTH * BOARD_LCD_HEIGHT * sizeof(uint16_t))
+#define LVGL_DRAW_BUFFER_LINES (BOARD_LCD_HEIGHT / 10)
+#define LVGL_DRAW_BUFFER_PIXELS \
+    (BOARD_LCD_WIDTH * LVGL_DRAW_BUFFER_LINES)
+#define LVGL_DRAW_BUFFER_BYTES \
+    (LVGL_DRAW_BUFFER_PIXELS * sizeof(uint16_t))
 
-/*
- * RGB565 将红、绿、蓝分别压缩为 5、6、5 bit。
- * 这些常量是已经编码好的 16 bit 颜色值，不是普通的 0xRRGGBB。
- */
-#define RGB565_NAVY 0x000F
-#define RGB565_CYAN 0x07FF
-#define RGB565_YELLOW 0xFFE0
-#define RGB565_GREEN 0x07E0
-#define RGB565_MAGENTA 0xF81F
+// 下列 RGB888 数值量化到 RGB565 后，与迁移前的界面颜色一致。
+#define UI_COLOR_NAVY 0x00007B
+#define UI_COLOR_CYAN 0x00FFFF
+#define UI_COLOR_YELLOW 0xFFFF00
+#define UI_COLOR_GREEN 0x00FF00
+#define UI_COLOR_MAGENTA 0xFF00FF
+
+// 原界面的边框距离四边 8 像素、宽 3 像素。
+#define UI_FRAME_INSET 8
+#define UI_FRAME_WIDTH 3
 
 static const char *TAG = "app_display";
 
 /*
- * 一个 glyph_t 表示一个 5×7 点阵字符。
- * columns[0..4] 是从左到右的五列，每个字节的低 7 bit 对应从上到下七行。
+ * 当前硬件只有一块 LCD，因此显示组件保持单例设计。LVGL 对象只能在取得
+ * esp_lvgl_port 的递归互斥锁后访问，避免按键任务与 LVGL 刷新任务并发操作。
  */
 typedef struct {
-    char character;
-    uint8_t columns[5];
-} glyph_t;
-
-/*
- * 显示模块的全部运行状态集中保存在这里。
- * 当前硬件只有一块 LCD，因此不要求应用层创建或管理对象。
- */
-typedef struct {
-    esp_lcd_panel_handle_t panel;   // esp_lcd 返回的 ST7789 面板句柄
-    uint8_t *frame;                 // 一整屏、支持 DMA 的 RGB565 帧缓冲
-    SemaphoreHandle_t transfer_done; // DMA 传输完成后由中断回调释放
-    SemaphoreHandle_t lock;         // 防止多个任务同时改写同一帧缓冲
-    bool initialized;               // 公共显示 API 是否已经可以使用
+    esp_lcd_panel_io_handle_t io; // SPI 面板 IO，交给 esp_lvgl_port 注册完成回调
+    esp_lcd_panel_handle_t panel; // ST7789 面板句柄
+    lv_display_t *display;        // LVGL 显示设备
+    lv_obj_t *frame;              // 原界面的彩色矩形边框
+    lv_obj_t *title;              // 顶部标题
+    lv_obj_t *message;            // 屏幕中央的提示或按键名称
+    bool initialized;             // 公共 API 是否已经可以使用
 } display_context_t;
 
-// static 限制变量只在本文件可见，避免其他模块绕过公开 API 直接修改状态。
 static display_context_t s_display;
 
-// 精简的 5×7 英文字库，仅收录当前界面实际需要的字符，以节省 Flash。
-static const glyph_t FONT[] = {
-    {'!', {0x00, 0x00, 0x5F, 0x00, 0x00}},
-    {'A', {0x7E, 0x09, 0x09, 0x09, 0x7E}},
-    {'B', {0x7F, 0x49, 0x49, 0x49, 0x36}},
-    {'D', {0x7F, 0x41, 0x41, 0x22, 0x1C}},
-    {'E', {0x7F, 0x49, 0x49, 0x49, 0x41}},
-    {'H', {0x7F, 0x08, 0x08, 0x08, 0x7F}},
-    {'L', {0x7F, 0x40, 0x40, 0x40, 0x40}},
-    {'N', {0x7F, 0x02, 0x04, 0x08, 0x7F}},
-    {'O', {0x3E, 0x41, 0x41, 0x41, 0x3E}},
-    {'P', {0x7F, 0x09, 0x09, 0x09, 0x06}},
-    {'R', {0x7F, 0x09, 0x19, 0x29, 0x46}},
-    {'S', {0x46, 0x49, 0x49, 0x49, 0x31}},
-    {'T', {0x01, 0x01, 0x7F, 0x01, 0x01}},
-    {'U', {0x3F, 0x40, 0x40, 0x40, 0x3F}},
-    {'W', {0x3F, 0x40, 0x38, 0x40, 0x3F}},
-};
-
 /**
- * @brief 在帧缓冲中设置一个像素。
+ * @brief 写入 Waveshare 这块 LCD 需要的附加寄存器设置。
  *
- * 坐标超出屏幕时直接忽略，避免调用者写出 frame 数组边界。
+ * ESP-IDF 的 ST7789 驱动负责通用的复位、像素格式、地址窗口和传输。本函数
+ * 只保留已经在本板实物上验证过的供电、porch 与帧率参数。引入 LVGL 不应
+ * 改变这一层硬件配置。
  */
-static void frame_set_pixel(uint8_t *frame, int x, int y, uint16_t color)
-{
-    if (x < 0 || x >= BOARD_LCD_WIDTH ||
-        y < 0 || y >= BOARD_LCD_HEIGHT) {
-        return;
-    }
-
-    /*
-     * ST7789 通过 SPI 接收 RGB565 时要求高字节先发送。
-     * ESP32-S3 本身是小端 CPU，所以这里不能直接用 uint16_t* 赋值；
-     * 必须明确把高 8 bit 写在前、低 8 bit 写在后。
-     */
-    const size_t offset =
-        ((size_t)y * BOARD_LCD_WIDTH + x) * sizeof(uint16_t);
-    frame[offset] = (uint8_t)(color >> 8);
-    frame[offset + 1] = (uint8_t)(color & 0xFF);
-}
-
-/**
- * @brief 在帧缓冲中填充一个实心矩形。
- *
- * 前半部分会把超出屏幕的矩形裁剪到有效区域。这样绘制边框或放大字符时，
- * 即使坐标恰好接近边缘，也不会发生越界写内存。
- */
-static void frame_fill_rect(uint8_t *frame, int x, int y, int width,
-                            int height, uint16_t color)
-{
-    if (x < 0) {
-        width += x;
-        x = 0;
-    }
-    if (y < 0) {
-        height += y;
-        y = 0;
-    }
-    if (x + width > BOARD_LCD_WIDTH) {
-        width = BOARD_LCD_WIDTH - x;
-    }
-    if (y + height > BOARD_LCD_HEIGHT) {
-        height = BOARD_LCD_HEIGHT - y;
-    }
-    if (width <= 0 || height <= 0) {
-        return;
-    }
-
-    for (int row = y; row < y + height; ++row) {
-        for (int column = x; column < x + width; ++column) {
-            frame_set_pixel(frame, column, row, color);
-        }
-    }
-}
-
-/**
- * @brief 从精简字库中查找字符点阵。
- *
- * @return 找到时返回五列点阵；未收录时返回 NULL。
- */
-static const uint8_t *font_find_glyph(char character)
-{
-    for (size_t i = 0; i < sizeof(FONT) / sizeof(FONT[0]); ++i) {
-        if (FONT[i].character == character) {
-            return FONT[i].columns;
-        }
-    }
-    return NULL;
-}
-
-/**
- * @brief 按指定倍数绘制一个 5×7 字符。
- *
- * 字库中的一个“点”会被扩展为 scale × scale 的实心矩形，从而在不准备
- * 多套字体资源的情况下显示更大的文字。
- */
-static void frame_draw_char(uint8_t *frame, int x, int y, char character,
-                            int scale, uint16_t color)
-{
-    const uint8_t *columns = font_find_glyph(character);
-    if (columns == NULL) {
-        // 空格和未收录字符保持为空白，不把它们当作致命错误。
-        return;
-    }
-
-    // 逐列、逐行检查点阵中的每一个 bit。
-    for (int column = 0; column < 5; ++column) {
-        for (int row = 0; row < 7; ++row) {
-            if ((columns[column] & (1U << row)) != 0) {
-                frame_fill_rect(frame, x + column * scale,
-                                y + row * scale, scale, scale, color);
-            }
-        }
-    }
-}
-
-/**
- * @brief 计算一行点阵文字绘制后的像素宽度。
- *
- * 每个字符占 5 列，字符之间留 1 列空白，因此步进是 6 列；
- * 最后一个字符后面不需要空白，所以总宽度再减 1 列。
- */
-static int frame_text_width(const char *text, int scale)
-{
-    const size_t length = strlen(text);
-    return length == 0 ? 0 : (int)(length * 6 - 1) * scale;
-}
-
-/**
- * @brief 从左到右绘制一行文字。
- */
-static void frame_draw_text(uint8_t *frame, int x, int y, const char *text,
-                            int scale, uint16_t color)
-{
-    while (*text != '\0') {
-        frame_draw_char(frame, x, y, *text, scale, color);
-        x += 6 * scale;
-        ++text;
-    }
-}
-
-/**
- * @brief 绘制本应用统一使用的“标题 + 主消息 + 彩色边框”画面。
- *
- * title 和 message 会根据实际像素宽度水平居中。这里只修改内存中的 frame，
- * 并不会立即操作 LCD；真正发送发生在 display_render_and_show()。
- */
-static void frame_draw_screen(uint8_t *frame, const char *title,
-                              const char *message, int message_scale,
-                              uint16_t accent_color)
-{
-    const int title_scale = 2;
-
-    // 先计算文字宽度，再用“屏幕剩余宽度的一半”得到居中的起点。
-    const int title_x =
-        (BOARD_LCD_WIDTH - frame_text_width(title, title_scale)) / 2;
-    const int message_x =
-        (BOARD_LCD_WIDTH - frame_text_width(message, message_scale)) / 2;
-    const int message_y =
-        (BOARD_LCD_HEIGHT - 7 * message_scale) / 2 + 12;
-
-    // 每次都重画整屏，避免上一帧较长的文字残留在新画面上。
-    frame_fill_rect(frame, 0, 0, BOARD_LCD_WIDTH, BOARD_LCD_HEIGHT,
-                    RGB565_NAVY);
-
-    // 四个矩形共同组成距离屏幕边缘 8 像素的边框。
-    frame_fill_rect(frame, 8, 8, BOARD_LCD_WIDTH - 16, 3, accent_color);
-    frame_fill_rect(frame, 8, BOARD_LCD_HEIGHT - 11,
-                    BOARD_LCD_WIDTH - 16, 3, accent_color);
-    frame_fill_rect(frame, 8, 8, 3, BOARD_LCD_HEIGHT - 16, accent_color);
-    frame_fill_rect(frame, BOARD_LCD_WIDTH - 11, 8, 3,
-                    BOARD_LCD_HEIGHT - 16, accent_color);
-
-    frame_draw_text(frame, title_x, 45, title, title_scale, RGB565_CYAN);
-    frame_draw_text(frame, message_x, message_y, message, message_scale,
-                    accent_color);
-}
-
-/**
- * @brief LCD 颜色数据发送完成回调。
- *
- * esp_lcd 会在 SPI DMA 中断上下文中调用此函数。中断中不能阻塞，也不能调用
- * 普通版本 xSemaphoreGive()，所以必须使用 xSemaphoreGiveFromISR()。
- *
- * 返回 true 表示本次释放信号量唤醒了更高优先级任务，FreeRTOS 可以在退出
- * 中断时立即切换到该任务。
- */
-static bool lcd_color_transfer_done(
-    esp_lcd_panel_io_handle_t panel_io,
-    esp_lcd_panel_io_event_data_t *event_data,
-    void *user_ctx)
-{
-    (void)panel_io;
-    (void)event_data;
-
-    // user_ctx 是创建 panel IO 时传入的 transfer_done 信号量。
-    BaseType_t high_priority_task_woken = pdFALSE;
-    xSemaphoreGiveFromISR((SemaphoreHandle_t)user_ctx,
-                          &high_priority_task_woken);
-    return high_priority_task_woken == pdTRUE;
-}
-
 static esp_err_t display_apply_waveshare_settings(
     esp_lcd_panel_io_handle_t io)
 {
-    /*
-     * 这些寄存器值来自 Waveshare 官方示例，用来配置供电和时序。
-     * ESP-IDF 自带的 ST7789 驱动已经负责复位、退出休眠、RGB565、地址窗口
-     * 和像素传输，所以这里只补充本块 LCD 特有的设置。
-     *
-     * 不要仅凭其他 ST7789 屏幕的代码修改这些值；同一控制器配合不同面板时，
-     * 电压、门控和 porch 参数仍可能不同。
-     */
     static const uint8_t ram_control[] = {0x00, 0xF0};
     static const uint8_t porch_control[] =
         {0x0C, 0x0C, 0x00, 0x33, 0x33};
@@ -339,90 +140,150 @@ static esp_err_t display_apply_waveshare_settings(
 }
 
 /**
- * @brief 将业务层颜色枚举转换为 LCD 使用的 RGB565 数值。
+ * @brief 将业务层强调色转换成 LVGL 颜色。
  *
- * 这层转换把像素格式细节留在显示组件内部。
+ * 业务层仍然不接触 RGB565 或 LVGL 类型，因此以后调整主题不会影响 app。
  */
-static uint16_t display_get_accent_color(app_display_accent_t accent)
+static lv_color_t display_get_accent_color(app_display_accent_t accent)
 {
     switch (accent) {
     case APP_DISPLAY_ACCENT_MAGENTA:
-        return RGB565_MAGENTA;
+        return lv_color_hex(UI_COLOR_MAGENTA);
     case APP_DISPLAY_ACCENT_GREEN:
-        return RGB565_GREEN;
+        return lv_color_hex(UI_COLOR_GREEN);
     case APP_DISPLAY_ACCENT_YELLOW:
     default:
-        return RGB565_YELLOW;
+        return lv_color_hex(UI_COLOR_YELLOW);
     }
 }
 
 /**
- * @brief 以线程安全方式绘制并发送一整帧。
+ * @brief 在已经取得 LVGL 锁的情况下更新界面内容。
  *
- * 完整流程：
- * 1. 获取 lock，独占帧缓冲；
- * 2. 在内存中画好整屏；
- * 3. 将 DMA 传输加入 esp_lcd 队列；
- * 4. 等待 transfer_done，确认 DMA 已经不再读取 frame；
- * 5. 释放 lock，允许下一个任务更新画面。
+ * @param title        顶部标题。
+ * @param message      中央文字。
+ * @param message_font 中央文字使用的 LVGL 字体。
+ * @param accent       边框和中央文字的强调色。
  *
- * 第 4 步非常重要：esp_lcd_panel_draw_bitmap() 只负责排队，DMA 在后台继续
- * 读取 frame。如果立即覆盖缓冲，屏幕可能出现撕裂、乱码或随机颜色。
+ * 此函数不自行加锁，供初始化和运行期更新共同复用。所有对象先完成属性更新，
+ * 最后重新对齐；这样字体高度改变时，中央文字仍会保持在原来的视觉中心。
  */
-static esp_err_t display_render_and_show(const char *title,
-                                         const char *message,
-                                         int message_scale,
-                                         uint16_t accent_color)
+static void display_set_ui_content_locked(const char *title,
+                                          const char *message,
+                                          const lv_font_t *message_font,
+                                          lv_color_t accent)
+{
+    lv_obj_set_style_border_color(s_display.frame, accent, LV_PART_MAIN);
+
+    lv_label_set_text(s_display.title, title);
+    lv_obj_set_style_text_color(
+        s_display.title, lv_color_hex(UI_COLOR_CYAN), LV_PART_MAIN);
+    lv_obj_set_style_text_font(
+        s_display.title, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_align(s_display.title, LV_ALIGN_TOP_MID, 0, 45);
+
+    lv_label_set_text(s_display.message, message);
+    lv_obj_set_style_text_color(s_display.message, accent, LV_PART_MAIN);
+    lv_obj_set_style_text_font(
+        s_display.message, message_font, LV_PART_MAIN);
+    lv_obj_align(s_display.message, LV_ALIGN_CENTER, 0, 12);
+}
+
+/**
+ * @brief 创建与迁移前外观和信息层级相同的 LVGL 对象树。
+ *
+ * UI 只创建一次；后续按键事件只修改已有对象，避免频繁分配和销毁对象造成
+ * 堆碎片。首次刷新发生在面板输出和背光开启之前，用户不会看到初始化噪点。
+ */
+static esp_err_t display_create_ui(void)
+{
+    ESP_RETURN_ON_FALSE(lvgl_port_lock(0), ESP_FAIL, TAG,
+                        "Failed to lock LVGL while creating UI");
+
+    lv_obj_t *screen = lv_display_get_screen_active(s_display.display);
+    lv_obj_set_style_bg_color(
+        screen, lv_color_hex(UI_COLOR_NAVY), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_display.frame = lv_obj_create(screen);
+    s_display.title = lv_label_create(screen);
+    s_display.message = lv_label_create(screen);
+
+    if (s_display.frame == NULL ||
+        s_display.title == NULL ||
+        s_display.message == NULL) {
+        lvgl_port_unlock();
+        return ESP_ERR_NO_MEM;
+    }
+
+    /*
+     * 基础 lv_obj 默认带背景、圆角、内边距和可滚动行为。这里全部显式关闭，
+     * 让它只承担迁移前“四条直线组成的边框”这一项视觉职责。
+     */
+    lv_obj_set_size(
+        s_display.frame,
+        BOARD_LCD_WIDTH - 2 * UI_FRAME_INSET,
+        BOARD_LCD_HEIGHT - 2 * UI_FRAME_INSET);
+    lv_obj_align(s_display.frame, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_opa(
+        s_display.frame, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(
+        s_display.frame, UI_FRAME_WIDTH, LV_PART_MAIN);
+    lv_obj_set_style_radius(s_display.frame, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(s_display.frame, 0, LV_PART_MAIN);
+    lv_obj_remove_flag(s_display.frame, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(s_display.frame, LV_OBJ_FLAG_CLICKABLE);
+
+    display_set_ui_content_locked(
+        "BUTTON TEST", "PRESS A BUTTON",
+        &lv_font_montserrat_20, lv_color_hex(UI_COLOR_YELLOW));
+
+    /*
+     * 正常运行时 esp_lvgl_port 的任务会自动处理脏区域。初始化阶段主动刷新，
+     * 是为了在点亮背光前先把第一帧完整写入 LCD GRAM。
+     */
+    lv_refr_now(s_display.display);
+    lvgl_port_unlock();
+    return ESP_OK;
+}
+
+/**
+ * @brief 以线程安全方式更新并立即刷新当前界面。
+ *
+ * 按键监听运行在独立 FreeRTOS 任务中，而 LVGL 也有自己的刷新任务。所有
+ * LVGL API 都必须位于 lvgl_port_lock()/unlock() 之间。这里保留“函数返回
+ * 时画面已经完成本次刷新”的同步语义，与迁移前等待 DMA 完成的行为一致。
+ */
+static esp_err_t display_update_ui(const char *title,
+                                   const char *message,
+                                   const lv_font_t *message_font,
+                                   lv_color_t accent)
 {
     ESP_RETURN_ON_FALSE(s_display.initialized, ESP_ERR_INVALID_STATE, TAG,
                         "Display is not initialized");
-    ESP_RETURN_ON_FALSE(title != NULL && message != NULL,
-                        ESP_ERR_INVALID_ARG, TAG, "Text must not be NULL");
+    ESP_RETURN_ON_FALSE(
+        title != NULL && message != NULL && message_font != NULL,
+        ESP_ERR_INVALID_ARG, TAG, "UI text and font must not be NULL");
+    ESP_RETURN_ON_FALSE(lvgl_port_lock(0), ESP_FAIL, TAG,
+                        "Failed to lock LVGL while updating UI");
 
-    // portMAX_DELAY 表示一直等待，直到上一位使用者释放显示锁。
-    if (xSemaphoreTake(s_display.lock, portMAX_DELAY) != pdTRUE) {
-        return ESP_FAIL;
-    }
+    display_set_ui_content_locked(title, message, message_font, accent);
+    lv_refr_now(s_display.display);
 
-    // 此时本任务独占 frame，可以安全生成新画面。
-    frame_draw_screen(s_display.frame, title, message, message_scale,
-                      accent_color);
-
-    // draw_bitmap 返回 ESP_OK 时，数据通常只是进入异步传输队列。
-    esp_err_t ret = esp_lcd_panel_draw_bitmap(
-        s_display.panel, 0, 0, BOARD_LCD_WIDTH, BOARD_LCD_HEIGHT,
-        s_display.frame);
-
-    // 等待中断回调发出完成信号后，frame 才能被下一帧复用。
-    if (ret == ESP_OK &&
-        xSemaphoreTake(s_display.transfer_done, portMAX_DELAY) != pdTRUE) {
-        ret = ESP_FAIL;
-    }
-
-    // 无论传输成功还是失败，都必须释放互斥锁，避免后续调用永久卡住。
-    xSemaphoreGive(s_display.lock);
-    return ret;
+    lvgl_port_unlock();
+    return ESP_OK;
 }
 
 esp_err_t app_display_init(void)
 {
-    // 本模块是单例，重复初始化 SPI 总线或面板会造成资源冲突。
+    // 本组件是单例；重复初始化会重复占用 SPI 总线并创建第二个 LVGL 任务。
     ESP_RETURN_ON_FALSE(!s_display.initialized, ESP_ERR_INVALID_STATE, TAG,
                         "Display is already initialized");
 
     /*
-     * transfer_done 用于“中断通知任务”，二值信号量足够；
-     * lock 用于“任务之间互斥”，因此使用带所有权语义的互斥量。
-     */
-    s_display.transfer_done = xSemaphoreCreateBinary();
-    s_display.lock = xSemaphoreCreateMutex();
-    ESP_RETURN_ON_FALSE(
-        s_display.transfer_done != NULL && s_display.lock != NULL,
-        ESP_ERR_NO_MEM, TAG, "Unable to create display semaphores");
-
-    /*
-     * 初始化过程中先关闭背光。这样用户不会看到 LCD 复位和写寄存器时的
-     * 随机内容；第一帧准备完成后再统一点亮。
+     * 初始化过程中先关闭背光。LCD 复位、写寄存器以及创建 LVGL 缓冲时都可能
+     * 暂时没有有效画面，先关闭背光可避免用户看到随机像素或白屏。
      */
     const gpio_config_t backlight_config = {
         .pin_bit_mask = 1ULL << BOARD_LCD_PIN_BACKLIGHT,
@@ -433,12 +294,13 @@ esp_err_t app_display_init(void)
     };
     ESP_RETURN_ON_ERROR(gpio_config(&backlight_config), TAG,
                         "Failed to configure LCD backlight");
-    ESP_RETURN_ON_ERROR(gpio_set_level(BOARD_LCD_PIN_BACKLIGHT, 0), TAG,
-                        "Failed to turn LCD backlight off");
+    ESP_RETURN_ON_ERROR(
+        gpio_set_level(BOARD_LCD_PIN_BACKLIGHT, 0), TAG,
+        "Failed to turn LCD backlight off");
 
     /*
-     * SPI 总线只发送数据到 LCD，因此 miso_io_num 设置为 -1。
-     * max_transfer_sz 必须至少容纳一整帧，否则整屏 draw_bitmap 会失败。
+     * LCD 只接收数据，所以 MISO 为 -1。max_transfer_sz 与一个 LVGL 部分刷新
+     * 缓冲相同；任意一次 flush 的像素数都不会超过该缓冲容量。
      */
     const spi_bus_config_t bus_config = {
         .mosi_io_num = BOARD_LCD_PIN_MOSI,
@@ -446,17 +308,15 @@ esp_err_t app_display_init(void)
         .sclk_io_num = BOARD_LCD_PIN_SCLK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = LCD_FRAME_BUFFER_SIZE,
+        .max_transfer_sz = LVGL_DRAW_BUFFER_BYTES,
     };
     ESP_RETURN_ON_ERROR(
         spi_bus_initialize(BOARD_LCD_HOST, &bus_config, SPI_DMA_CH_AUTO),
         TAG, "Failed to initialize LCD SPI bus");
 
     /*
-     * panel IO 描述“如何通过 SPI 与 LCD 交换命令和数据”：
-     * - spi_mode=3 和 40 MHz 已经在实物上验证；
-     * - lcd_cmd_bits/lcd_param_bits=8 表示命令和参数都是 8 bit；
-     * - 回调与 user_ctx 共同实现 DMA 完成通知。
+     * 不在此处安装 DMA 完成回调。lvgl_port_add_disp() 会向同一个 IO 注册
+     * 回调，并在传输完成时通知 LVGL 哪个绘制缓冲可以安全复用。
      */
     const esp_lcd_panel_io_spi_config_t io_config = {
         .dc_gpio_num = BOARD_LCD_PIN_DC,
@@ -466,84 +326,116 @@ esp_err_t app_display_init(void)
         .lcd_param_bits = 8,
         .spi_mode = 3,
         .trans_queue_depth = 10,
-        .on_color_trans_done = lcd_color_transfer_done,
-        .user_ctx = s_display.transfer_done,
     };
-
-    esp_lcd_panel_io_handle_t io = NULL;
     ESP_RETURN_ON_ERROR(
         esp_lcd_new_panel_io_spi(
-            (esp_lcd_spi_bus_handle_t)BOARD_LCD_HOST, &io_config, &io),
+            (esp_lcd_spi_bus_handle_t)BOARD_LCD_HOST,
+            &io_config, &s_display.io),
         TAG, "Failed to create LCD panel IO");
 
-    // panel 对象描述具体控制器型号和像素格式，这里选择 ST7789 + RGB565。
     const esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = BOARD_LCD_PIN_RESET,
         .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
         .bits_per_pixel = 16,
     };
     ESP_RETURN_ON_ERROR(
-        esp_lcd_new_panel_st7789(io, &panel_config, &s_display.panel),
+        esp_lcd_new_panel_st7789(
+            s_display.io, &panel_config, &s_display.panel),
         TAG, "Failed to create ST7789 panel");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(s_display.panel), TAG,
-                        "Failed to reset LCD panel");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_display.panel), TAG,
-                        "Failed to initialize LCD panel");
-
-    // 在第一帧准备好之前暂时关闭面板输出，与背光关闭配合避免闪屏。
+    ESP_RETURN_ON_ERROR(
+        esp_lcd_panel_reset(s_display.panel), TAG,
+        "Failed to reset LCD panel");
+    ESP_RETURN_ON_ERROR(
+        esp_lcd_panel_init(s_display.panel), TAG,
+        "Failed to initialize LCD panel");
     ESP_RETURN_ON_ERROR(
         esp_lcd_panel_disp_on_off(s_display.panel, false), TAG,
         "Failed to disable LCD panel");
 
-    ESP_RETURN_ON_ERROR(display_apply_waveshare_settings(io), TAG,
-                        "Failed to apply Waveshare LCD settings");
+    ESP_RETURN_ON_ERROR(
+        display_apply_waveshare_settings(s_display.io), TAG,
+        "Failed to apply Waveshare LCD settings");
     ESP_RETURN_ON_ERROR(
         esp_lcd_panel_invert_color(s_display.panel, true), TAG,
         "Failed to enable LCD color inversion");
 
     /*
-     * 普通 malloc 得到的内存不一定能被 SPI DMA 访问。
-     * spi_bus_dma_memory_alloc() 会返回符合当前 SPI 总线 DMA 要求的缓冲区。
-     * 缓冲区会在程序整个运行期间反复使用，因此这里不释放它。
+     * esp_lvgl_port 为本项目创建 LVGL tick 定时器和刷新任务。暂时沿用适配层
+     * 的默认优先级、栈和 5 ms tick；后续真正加入桌宠动画后再用测量结果调优。
      */
-    s_display.frame = spi_bus_dma_memory_alloc(
-        BOARD_LCD_HOST, LCD_FRAME_BUFFER_SIZE, 0);
-    ESP_RETURN_ON_FALSE(s_display.frame != NULL, ESP_ERR_NO_MEM, TAG,
-                        "Unable to allocate LCD frame buffer");
+    const lvgl_port_cfg_t lvgl_config = ESP_LVGL_PORT_INIT_CONFIG();
+    ESP_RETURN_ON_ERROR(
+        lvgl_port_init(&lvgl_config), TAG,
+        "Failed to initialize LVGL port");
 
     /*
-     * 只有完成上述所有关键步骤后才标记 initialized，公共绘图函数会检查
-     * 这个标志。先画好提示画面，再开启面板和背光。
+     * ST7789 通过 SPI 接收 RGB565 时需要高字节在前，ESP32-S3 内存中则是
+     * 小端序，因此启用 swap_bytes。迁移前由手写 set_pixel() 逐像素完成
+     * 同一转换，现在统一交给 esp_lvgl_port 在 flush 前处理。
+     */
+    const lvgl_port_display_cfg_t display_config = {
+        .io_handle = s_display.io,
+        .panel_handle = s_display.panel,
+        .buffer_size = LVGL_DRAW_BUFFER_PIXELS,
+        .double_buffer = true,
+        .hres = BOARD_LCD_WIDTH,
+        .vres = BOARD_LCD_HEIGHT,
+        .monochrome = false,
+        .rotation = {
+            .swap_xy = false,
+            .mirror_x = false,
+            .mirror_y = false,
+        },
+        .color_format = LV_COLOR_FORMAT_RGB565,
+        .flags = {
+            .buff_dma = true,
+            .buff_spiram = false,
+            .sw_rotate = false,
+            .swap_bytes = true,
+            .full_refresh = false,
+            .direct_mode = false,
+        },
+    };
+    s_display.display = lvgl_port_add_disp(&display_config);
+    ESP_RETURN_ON_FALSE(
+        s_display.display != NULL, ESP_ERR_NO_MEM, TAG,
+        "Failed to add LCD to LVGL");
+
+    ESP_RETURN_ON_ERROR(
+        display_create_ui(), TAG,
+        "Failed to create initial LVGL UI");
+
+    /*
+     * 只有硬件、LVGL、对象树和第一帧都准备好后才开放公共 API 并点亮屏幕。
+     * 这也维持了原先“显示初始化完成后再启动按键任务”的调用契约。
      */
     s_display.initialized = true;
-    ESP_RETURN_ON_ERROR(app_display_show_prompt(), TAG,
-                        "Failed to draw initial screen");
     ESP_RETURN_ON_ERROR(
         esp_lcd_panel_disp_on_off(s_display.panel, true), TAG,
         "Failed to enable LCD panel");
-    ESP_RETURN_ON_ERROR(gpio_set_level(BOARD_LCD_PIN_BACKLIGHT, 1), TAG,
-                        "Failed to turn LCD backlight on");
+    ESP_RETURN_ON_ERROR(
+        gpio_set_level(BOARD_LCD_PIN_BACKLIGHT, 1), TAG,
+        "Failed to turn LCD backlight on");
 
-    ESP_LOGI(TAG, "LCD is ready");
+    ESP_LOGI(TAG, "LCD and LVGL are ready");
     return ESP_OK;
 }
 
 esp_err_t app_display_show_prompt(void)
 {
-    // 提示页使用较小字号，确保完整句子可以在 240 像素宽度内居中显示。
-    return display_render_and_show("BUTTON TEST", "PRESS A BUTTON", 2,
-                                   RGB565_YELLOW);
+    return display_update_ui(
+        "BUTTON TEST", "PRESS A BUTTON",
+        &lv_font_montserrat_20, lv_color_hex(UI_COLOR_YELLOW));
 }
 
 esp_err_t app_display_show_button(const char *button_name,
                                   app_display_accent_t accent)
 {
-    // APP_DISPLAY_ACCENT_COUNT 是哨兵值，不代表一种可显示颜色。
-    ESP_RETURN_ON_FALSE(accent >= 0 && accent < APP_DISPLAY_ACCENT_COUNT,
-                        ESP_ERR_INVALID_ARG, TAG,
-                        "Invalid display accent");
+    ESP_RETURN_ON_FALSE(
+        accent >= 0 && accent < APP_DISPLAY_ACCENT_COUNT,
+        ESP_ERR_INVALID_ARG, TAG, "Invalid display accent");
 
-    // 按键名称较短，使用 6 倍点阵字号突出显示。
-    return display_render_and_show(
-        "BUTTON", button_name, 6, display_get_accent_color(accent));
+    return display_update_ui(
+        "BUTTON", button_name,
+        &lv_font_montserrat_42, display_get_accent_color(accent));
 }

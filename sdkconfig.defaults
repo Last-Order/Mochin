@@ -15,3 +15,8 @@ CONFIG_SPIRAM_USE_MALLOC=y
 # The board's USB-C connector is wired to the ESP32-S3 native
 # USB Serial/JTAG controller, so logs and idf.py monitor use the same COM port.
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# 当前按键界面使用两种字号。显式写入 defaults，确保 set-target 重新生成
+# sdkconfig 后仍会编译所需字体；未使用的字体不必全部放入固件。
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_42=y

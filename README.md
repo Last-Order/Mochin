@@ -2,8 +2,12 @@
 
 这是一个面向初学者的纯 ESP-IDF 项目，适用于 Waveshare
 `ESP32-S3-Touch-LCD-1.54`。程序使用 ESP-IDF 的 `esp_lcd` API 驱动
-240 × 240 ST7789 屏幕，并监听三个板载按键。按下按键后，屏幕会显示其
-丝印名称：`BOOT`、`PWR` 或 `PLUS`。
+240 × 240 ST7789 屏幕，使用 LVGL 绘制界面，并监听三个板载按键。按下
+按键后，屏幕会显示其丝印名称：`BOOT`、`PWR` 或 `PLUS`。
+
+当前功能与引入 LVGL 前保持一致：开机显示 `PRESS A BUTTON`，三个按键
+分别使用黄、品红、绿色强调色。LVGL 目前只接管文字、边框、布局、部分刷新
+和绘制缓冲生命周期，为后续桌面宠物的图片与动画打基础。
 
 ## 目录结构
 
@@ -21,8 +25,9 @@
     │   ├── CMakeLists.txt
     │   └── include/board/
     │       └── board_config.h
-    ├── display/                   # 显示层：LCD 初始化、绘图和 DMA 传输
+    ├── display/                   # 显示层：LCD 初始化、LVGL 界面和 DMA 刷新
     │   ├── CMakeLists.txt
+    │   ├── idf_component.yml      # 锁定 LVGL 与 ESP 适配层版本
     │   ├── app_display.c
     │   └── include/display/
     │       └── app_display.h
@@ -58,8 +63,19 @@ app ──> display ──> board
 2. 阅读 `display/app_display.h` 和 `input/board_buttons.h`，了解应用层可以
    调用哪些公开接口。
 3. 阅读 `board_buttons.c`，理解 FreeRTOS 轮询任务和软件消抖。
-4. 阅读 `app_display.c`，理解 LCD 初始化、帧缓冲绘制和 DMA 传输。
+4. 阅读 `app_display.c`，理解 LCD 初始化、LVGL 对象、部分绘制缓冲和
+   DMA 传输。
 5. 最后查看 `board/board_config.h`，对应具体 GPIO 和硬件参数。
+
+显示组件内部继续使用已经实物验证的 `esp_lcd` ST7789 初始化序列。LVGL
+并不直接操作 GPIO 或 SPI，而是通过 `esp_lvgl_port` 把需要更新的区域交给
+`esp_lcd`。当前锁定的组件版本为：
+
+- LVGL `9.5.0`
+- `espressif/esp_lvgl_port` `2.8.0~1`
+
+首次配置或清理 `managed_components/` 后构建时，ESP-IDF 组件管理器会自动
+下载这些依赖；不要手工修改 `managed_components/` 中的生成内容。
 
 ## 开发环境
 
@@ -104,4 +120,6 @@ idf.py -p <PORT> flash monitor
 | PLUS | 4 | 低电平 |
 
 工程默认按照 ESP32-S3R8 配置 16 MB QIO Flash、8 MB Octal PSRAM，并使用
-USB Serial/JTAG 输出串口日志。
+USB Serial/JTAG 输出串口日志。LVGL 当前使用两个 240 × 24 像素的 RGB565
+DMA 绘制缓冲，总计约 23 KB；界面发生变化时只刷新脏区域，不再维护和发送
+一块由应用代码手工绘制的整屏帧缓冲。

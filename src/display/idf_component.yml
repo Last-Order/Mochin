@@ -1,0 +1,10 @@
+## display 组件的第三方依赖。
+##
+## 版本使用精确约束，而不是跟随“最新版”。这样重新配置工程时不会因为
+## LVGL 或适配层自动升级而改变 API、内存占用或屏幕刷新行为。
+dependencies:
+  espressif/esp_lvgl_port:
+    version: "==2.8.0~1"
+  lvgl/lvgl:
+    version: "==9.5.0"
+    public: true

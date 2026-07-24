@@ -3,7 +3,7 @@
 /*
  * display 组件通过 app_display API 向应用层提供显示屏功能。
  *
- * 调用者不需要知道 SPI、ST7789、帧缓冲或 DMA 的细节，只需：
+ * 调用者不需要知道 SPI、ST7789、LVGL 或 DMA 的细节，只需：
  * 1. 启动时调用一次 app_display_init()；
  * 2. 按需调用 app_display_show_prompt() 或 app_display_show_button()。
  *
@@ -28,8 +28,9 @@ typedef enum {
 /**
  * @brief 初始化 ST7789 LCD，并显示初始的按键提示画面。
  *
- * 此函数会配置背光 GPIO、SPI 总线、esp_lcd、DMA 帧缓冲和同步信号量。
- * 必须在其他 app_display_* 函数之前调用，且整个程序只调用一次。
+ * 此函数会配置背光 GPIO、SPI 总线、esp_lcd、LVGL 任务和双 DMA 绘制缓冲，
+ * 并在点亮背光前显示初始画面。必须在其他 app_display_* 函数之前调用，
+ * 且整个程序只调用一次。
  *
  * @return ESP_OK 成功；其他值表示具体的 ESP-IDF 初始化错误。
  */
