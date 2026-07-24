@@ -1,0 +1,14 @@
+# ESP32-S3-Touch-LCD-1.54 的 16 MB Flash 分区表。
+#
+# 当前阶段不使用 OTA，因此只保留一个较大的 factory 应用分区：
+# - 继续沿用 ESP-IDF 默认布局的 NVS、PHY 和应用起始地址，避免无意义地
+#   移动已有数据；
+# - 为程序、LVGL 字体和初期内嵌图片提供 8 MiB 空间；
+# - 预留 256 KiB coredump 分区，后续启用崩溃转储时无需再移动应用；
+# - 0x850000 之后约 7.69 MiB 暂不分区，将来可追加 assets 文件系统。
+#
+# Name,    Type, SubType, Offset,  Size, Flags
+nvs,       data, nvs,     0x9000,  0x6000,
+phy_init,  data, phy,     0xf000,  0x1000,
+factory,   app,  factory, 0x10000, 8M,
+coredump,  data, coredump,        , 256K,
