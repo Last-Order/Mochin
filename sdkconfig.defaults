@@ -21,7 +21,6 @@ CONFIG_SPIRAM_USE_MALLOC=y
 # USB Serial/JTAG controller, so logs and idf.py monitor use the same COM port.
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 
-# 当前按键界面使用两种字号。显式写入 defaults，确保 set-target 重新生成
-# sdkconfig 后仍会编译所需字体；未使用的字体不必全部放入固件。
-CONFIG_LV_FONT_MONTSERRAT_20=y
-CONFIG_LV_FONT_MONTSERRAT_42=y
+# 待机动画资源使用“RGB565 颜色平面 + A8 透明度平面”。显式保留软件绘制
+# 支持，确保重新生成 sdkconfig 后仍能正确混合雪碧图的透明边缘。
+CONFIG_LV_DRAW_SW_SUPPORT_RGB565A8=y

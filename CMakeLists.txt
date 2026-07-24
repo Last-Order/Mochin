@@ -10,4 +10,4 @@ set(SUPPORTED_TARGETS esp32s3)
 set(EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_LIST_DIR}/src")
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(esp32_s3_touch_lcd_154_button_display)
+project(esp32_s3_touch_lcd_154_pet)

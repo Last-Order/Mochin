@@ -24,19 +24,19 @@
     ├── app/                # 应用入口，只负责编排组件
     ├── board/              # 板级引脚和硬件参数
     ├── display/            # LCD 与图形显示
-    └── input/              # 输入设备
+    └── standby/            # 待机页面、动画与页面资源
 ```
 
 组件依赖保持单向：
 
 ```text
 app ──> display ──> board
- └────> input   ──> board
+ └────> standby ──> LVGL
 ```
 
 新增功能应在 `src/` 下建立职责单一的组件，不要把实现集中到
 `app_main.c`。公开头文件放在 `include/<组件名>/`，并使用带组件前缀的
-引用形式，例如 `#include "display/app_display.h"`。
+引用形式，例如 `#include "display/lcd_display.h"`。
 
 `sdkconfig`、`sdkconfig.old`、`build/` 和 `managed_components/` 是生成内容，
 不要提交或手工修改。稳定配置写入 `sdkconfig.defaults`，第三方依赖写入
