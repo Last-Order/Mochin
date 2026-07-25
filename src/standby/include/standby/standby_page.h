@@ -36,6 +36,18 @@ esp_err_t standby_page_start(void);
 esp_err_t standby_page_start_with_scene(standby_scene_id_t scene_id);
 
 /**
+ * @brief 在 LCD 首帧已经显示后添加待机时钟卡片。
+ *
+ * 必须在 standby_page_start() 和 lcd_display_enable() 成功后调用，整个
+ * 程序只能调用一次。把时钟放到首帧同步刷新之后创建，可让后续绘制由
+ * LVGL 任务完成，避免复杂对象树占用 app_main 的有限任务栈。
+ *
+ * @return ESP_OK 成功；页面未启动、重复调用、内存不足或无法取得 LVGL
+ *         锁时返回对应错误。
+ */
+esp_err_t standby_page_show_clock(void);
+
+/**
  * @brief 在待机页面运行期间切换场景背景。
  *
  * 必须在页面启动后从普通任务上下文调用，不可在 LVGL 定时器或事件回调中

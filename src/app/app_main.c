@@ -41,6 +41,11 @@ void app_main(void)
     ESP_ERROR_CHECK(lcd_display_init());
     ESP_ERROR_CHECK(standby_page_start());
     ESP_ERROR_CHECK(lcd_display_enable());
+    /*
+     * 首帧同步刷新只包含背景和角色。时钟对象在面板点亮后加入，后续刷新
+     * 由 LVGL 自己的任务执行，避免 app_main 的默认任务栈承担复杂叠层绘制。
+     */
+    ESP_ERROR_CHECK(standby_page_show_clock());
     ESP_ERROR_CHECK(
         power_manager_start(app_prepare_power_off, NULL));
 

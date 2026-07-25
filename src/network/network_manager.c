@@ -263,10 +263,13 @@ esp_err_t network_manager_start(void)
                         ESP_ERR_INVALID_STATE, TAG,
                         "Wi-Fi STA is already started");
 
-    const size_t ssid_length =
-        strnlen(CONFIG_PET_WIFI_SSID, NETWORK_WIFI_SSID_MAX_BYTES + 1U);
-    const size_t password_length = strnlen(
-        CONFIG_PET_WIFI_PASSWORD, NETWORK_WIFI_PASSWORD_MAX_BYTES + 1U);
+    /*
+     * Kconfig 字符串始终以 NUL 结尾，先取实际长度再按 Wi-Fi 协议字段上限
+     * 校验。不能给 strnlen() 一个大于编译期字面量对象的上界，否则 GCC
+     * 的 stringop-overread 检查会把合法的短配置视为构建错误。
+     */
+    const size_t ssid_length = strlen(CONFIG_PET_WIFI_SSID);
+    const size_t password_length = strlen(CONFIG_PET_WIFI_PASSWORD);
     ESP_RETURN_ON_FALSE(
         ssid_length > 0U && ssid_length <= NETWORK_WIFI_SSID_MAX_BYTES,
         ESP_ERR_INVALID_ARG, TAG,

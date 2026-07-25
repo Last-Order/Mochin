@@ -209,16 +209,52 @@ esp_err_t standby_page_start_with_scene(standby_scene_id_t scene_id)
         s_page.image, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
 
     /*
-     * 时钟在角色之后创建，始终位于透明角色图片之上。固定 80 × 30 卡片只
-     * 占用屏幕顶部一小块区域；背景使用半透明深棕色，即使角色头部经过
-     * 卡片下方也能保持文字可读。
+     * 定时器属于 LVGL 对象体系，由 LVGL 任务周期调用。400 ms 对应
+     * 2.5 fps，一轮 7 帧约 2.8 秒，让轻微呼吸/眨眼动作保持舒缓。
      */
-    s_page.clock_panel = lv_obj_create(screen);
-    if (s_page.clock_panel == NULL) {
+    s_page.animation_timer = lv_timer_create(
+        standby_animation_timer_cb, STANDBY_FRAME_INTERVAL_MS, &s_page);
+    if (s_page.animation_timer == NULL) {
         lv_obj_delete(s_page.image);
         lv_obj_delete(s_page.background);
         s_page.image = NULL;
         s_page.background = NULL;
+        lvgl_port_unlock();
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_page.started = true;
+    lvgl_port_unlock();
+
+    ESP_LOGI(
+        TAG,
+        "Standby page started: scene=%s, %d frames, %d ms/frame",
+        scene->name, STANDBY_FRAME_COUNT, STANDBY_FRAME_INTERVAL_MS);
+    return ESP_OK;
+}
+
+esp_err_t standby_page_start(void)
+{
+    return standby_page_start_with_scene(STANDBY_SCENE_INDOOR);
+}
+
+esp_err_t standby_page_show_clock(void)
+{
+    ESP_RETURN_ON_FALSE(s_page.started, ESP_ERR_INVALID_STATE, TAG,
+                        "Standby page is not started");
+    ESP_RETURN_ON_FALSE(
+        s_page.clock_panel == NULL && s_page.clock_timer == NULL,
+        ESP_ERR_INVALID_STATE, TAG, "Standby clock is already shown");
+    ESP_RETURN_ON_FALSE(lvgl_port_lock(0), ESP_FAIL, TAG,
+                        "Failed to lock LVGL while creating clock");
+
+    /*
+     * 时钟在角色之后创建，始终位于透明角色图片之上。此接口只在 LCD 首帧
+     * 已由 app_main 同步刷新后调用，因此新对象的绘制由 LVGL 任务异步完成，
+     * 不会继续消耗 app_main 默认只有 3584 字节的任务栈。
+     */
+    s_page.clock_panel = lv_obj_create(lv_screen_active());
+    if (s_page.clock_panel == NULL) {
         lvgl_port_unlock();
         return ESP_ERR_NO_MEM;
     }
@@ -251,11 +287,7 @@ esp_err_t standby_page_start_with_scene(standby_scene_id_t scene_id)
     s_page.clock_label = lv_label_create(s_page.clock_panel);
     if (s_page.clock_label == NULL) {
         lv_obj_delete(s_page.clock_panel);
-        lv_obj_delete(s_page.image);
-        lv_obj_delete(s_page.background);
         s_page.clock_panel = NULL;
-        s_page.image = NULL;
-        s_page.background = NULL;
         lvgl_port_unlock();
         return ESP_ERR_NO_MEM;
     }
@@ -271,53 +303,19 @@ esp_err_t standby_page_start_with_scene(standby_scene_id_t scene_id)
         s_page.clock_label,
         LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
 
-    /*
-     * 定时器属于 LVGL 对象体系，由 LVGL 任务周期调用。400 ms 对应
-     * 2.5 fps，一轮 7 帧约 2.8 秒，让轻微呼吸/眨眼动作保持舒缓。
-     */
-    s_page.animation_timer = lv_timer_create(
-        standby_animation_timer_cb, STANDBY_FRAME_INTERVAL_MS, &s_page);
-    if (s_page.animation_timer == NULL) {
-        lv_obj_delete(s_page.clock_panel);
-        lv_obj_delete(s_page.image);
-        lv_obj_delete(s_page.background);
-        s_page.clock_panel = NULL;
-        s_page.clock_label = NULL;
-        s_page.image = NULL;
-        s_page.background = NULL;
-        lvgl_port_unlock();
-        return ESP_ERR_NO_MEM;
-    }
-
     s_page.clock_timer = lv_timer_create(
         standby_clock_timer_cb, STANDBY_CLOCK_INTERVAL_MS, &s_page);
     if (s_page.clock_timer == NULL) {
-        lv_timer_delete(s_page.animation_timer);
         lv_obj_delete(s_page.clock_panel);
-        lv_obj_delete(s_page.image);
-        lv_obj_delete(s_page.background);
-        s_page.animation_timer = NULL;
         s_page.clock_panel = NULL;
         s_page.clock_label = NULL;
-        s_page.image = NULL;
-        s_page.background = NULL;
         lvgl_port_unlock();
         return ESP_ERR_NO_MEM;
     }
 
-    s_page.started = true;
     lvgl_port_unlock();
-
-    ESP_LOGI(
-        TAG,
-        "Standby page started: scene=%s, %d frames, %d ms/frame",
-        scene->name, STANDBY_FRAME_COUNT, STANDBY_FRAME_INTERVAL_MS);
+    ESP_LOGI(TAG, "Standby clock shown; waiting for SNTP sync");
     return ESP_OK;
-}
-
-esp_err_t standby_page_start(void)
-{
-    return standby_page_start_with_scene(STANDBY_SCENE_INDOOR);
 }
 
 esp_err_t standby_page_set_scene(standby_scene_id_t scene_id)
